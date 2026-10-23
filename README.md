@@ -29,19 +29,40 @@ A **pure-Rust, zero-Python**, native asynchronous fingerprint authentication dae
 
 ---
 
-## 🚀 Installation (Fedora RPM)
+## 🚀 Installation (Fedora / RHEL)
 
-Build and install the official RPM package:
+### Option 1: Install Pre-Built RPM (Recommended)
+
+Download and install the latest release directly from GitHub:
+
+```bash
+sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.0/validity-rs-0.1.0-1.fc44.x86_64.rpm
+```
+
+### Option 2: Build and Install from Source
+
+Requirements: `rust`, `cargo`, `rpm-build`.
 
 ```bash
 # Build the RPM package
 ./packaging/build-rpm.sh
 
-# Install via DNF
+# Install the generated RPM
 sudo dnf install -y target/rpmbuild/RPMS/*/*.rpm
 ```
 
-To uninstall and restore standard fprintd at any time:
+### Enabling Fingerprint in PAM
+
+If you haven't already enabled fingerprint authentication on your Fedora system, enable it with `authselect`:
+
+```bash
+sudo authselect enable-feature with-fingerprint
+sudo authselect apply-changes
+```
+
+### Uninstallation
+
+To uninstall and revert to standard `fprintd` at any time:
 ```bash
 sudo dnf remove -y validity-rs
 ```
