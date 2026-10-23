@@ -25,7 +25,7 @@ A native Linux fingerprint daemon for Validity Sensors (`138a:0097`) commonly fo
 Install the latest package directly from GitHub Releases:
 
 ```bash
-sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.2/validity-rs-0.1.2-1.fc44.x86_64.rpm
+sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.3/validity-rs-0.1.3-1.fc44.x86_64.rpm
 ```
 
 ### Building from Source

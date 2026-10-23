@@ -192,6 +192,36 @@ pub fn build_cmd_02(calib_data: &[u8], calib_vals: &[u8], mode: CaptureMode) -> 
     cmd
 }
 
+/// Outcome of a failed capture, so callers can decide whether to re-arm, retry or give up.
+#[derive(Debug)]
+pub enum CaptureError {
+    /// The operation was cancelled by the client.
+    Cancelled,
+    /// No finger was placed within the capture window.
+    Timeout,
+    /// The sensor reported a bad scan (finger moved, partial touch, ...).
+    ScanProblem(u32),
+    /// USB / TLS / protocol failure.
+    Device(String),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::Cancelled => write!(f, "capture cancelled"),
+            CaptureError::Timeout => write!(f, "capture timed out waiting for finger"),
+            CaptureError::ScanProblem(code) => write!(f, "sensor scanning problem: 0x{:08x}", code),
+            CaptureError::Device(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl From<String> for CaptureError {
+    fn from(e: String) -> Self {
+        CaptureError::Device(e)
+    }
+}
+
 struct DeviceConnection {
     interface: nusb::Interface,
     out_ep: nusb::Endpoint<Bulk, Out>,
@@ -205,6 +235,9 @@ pub struct SensorDriver {
     pub calib_data: Vec<u8>,
     pub calib_vals: Vec<u8>,
     pub stg_id: u16,
+    /// Incremented on every successful (re)connect. Sensor-side session state such as an
+    /// in-progress enrollment does not survive a reconnect, so callers can detect that.
+    pub generation: u64,
 }
 
 impl SensorDriver {
@@ -215,6 +248,7 @@ impl SensorDriver {
             calib_data,
             calib_vals,
             stg_id,
+            generation: 1,
         })
     }
 
@@ -228,8 +262,13 @@ impl SensorDriver {
         self.calib_data = calib_data;
         self.calib_vals = calib_vals;
         self.stg_id = stg_id;
+        self.generation = self.generation.wrapping_add(1);
         eprintln!("Sensor hardware reconnected successfully! Windsor storage ID: {}", self.stg_id);
         Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.conn.is_some()
     }
 
     fn get_conn_mut(&mut self) -> Result<&mut DeviceConnection, String> {
@@ -238,8 +277,9 @@ impl SensorDriver {
 
     pub async fn ensure_connected(&mut self) -> Result<(), String> {
         // Quick probe: query sensor hardware type (0x75)
-        if let Err(e) = self.send_app_cmd(&[0x75]).await {
-            eprintln!("Sensor connection check failed ({}), attempting reconnect...", e);
+        let healthy = self.conn.is_some() && self.send_app_cmd_once(&[0x75]).await.is_ok();
+        if !healthy {
+            eprintln!("Sensor connection check failed, attempting reconnect...");
             self.reconnect().await?;
         }
         Ok(())
@@ -469,63 +509,80 @@ impl SensorDriver {
             .map_err(|_| format!("Timeout writing {} bytes to EP 0x01", cmd.len()))?;
         comp.into_result().map_err(|e| format!("USB Out failed: {}", e))?;
 
-        in_ep.submit(in_ep.allocate(64 * 1024));
+        // Reuse an already-pending IN transfer (e.g. the drain read issued at connect time)
+        // instead of stacking another one behind it.
+        if in_ep.pending() == 0 {
+            in_ep.submit(in_ep.allocate(64 * 1024));
+        }
         let comp = tokio::time::timeout(timeout, in_ep.next_complete()).await
             .map_err(|_| "Timeout reading response from EP 0x81".to_string())?;
         let buf = comp.into_result().map_err(|e| format!("USB In failed: {}", e))?;
         Ok(buf.to_vec())
     }
 
-    pub async fn send_app_cmd_once(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let app_req = {
-            let conn = self.get_conn_mut()?;
-            conn.tls.make_app_data(payload).map_err(|e| e.to_string())?
-        };
-        let conn = self.get_conn_mut()?;
-        let rsp = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(5)).await?;
-        let dec = conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
-        Ok(dec)
+    /// One encrypted request/response round trip on an established connection.
+    async fn exchange(conn: &mut DeviceConnection, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+        let app_req = conn.tls.make_app_data(payload).map_err(|e| e.to_string())?;
+        let rsp = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, timeout).await?;
+        conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())
     }
 
+    /// Send a command exactly once. Use this for anything that mutates sensor state.
+    ///
+    /// On any failure the connection is dropped: a timed-out transfer may still be pending,
+    /// or the sensor may deliver the late reply to the *next* request. Reconnecting is the
+    /// only way to guarantee requests and responses stay paired.
+    pub async fn send_app_cmd_once(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let conn = self.get_conn_mut()?;
+        let res = Self::exchange(conn, payload, Duration::from_secs(5)).await;
+        if res.is_err() {
+            self.conn = None;
+        }
+        res
+    }
+
+    /// Send an idempotent command, reconnecting and retrying once on failure.
     pub async fn send_app_cmd(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let app_req = {
-            let conn = self.get_conn_mut()?;
-            conn.tls.make_app_data(payload).map_err(|e| e.to_string())?
-        };
-        let raw_res = {
-            let conn = self.get_conn_mut()?;
-            Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(5)).await
-        };
-        match raw_res {
-            Ok(rsp) => {
-                let parse_res = {
-                    let conn = self.get_conn_mut()?;
-                    conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())
-                };
-                match parse_res {
-                    Ok(dec) => Ok(dec),
-                    Err(msg) => {
-                        eprintln!("TLS error ({}), attempting sensor reconnect...", msg);
-                        self.reconnect().await?;
-                        self.send_app_cmd_once(payload).await
-                    }
-                }
-            }
+        if self.conn.is_none() {
+            self.reconnect().await?;
+        }
+        match self.send_app_cmd_once(payload).await {
+            Ok(dec) => Ok(dec),
             Err(msg) => {
-                eprintln!("USB I/O error ({}), attempting sensor reconnect...", msg);
+                eprintln!("Sensor command failed ({}), reconnecting and retrying...", msg);
                 self.reconnect().await?;
                 self.send_app_cmd_once(payload).await
             }
         }
     }
 
-    pub async fn wait_int(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
+    /// Wait for an interrupt. `Ok(None)` means the timeout elapsed.
+    ///
+    /// Exactly one interrupt transfer is kept outstanding; on timeout it stays queued and is
+    /// picked up by the next call, so transfers never pile up and no interrupt is lost.
+    pub async fn poll_int(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
         let conn = self.get_conn_mut()?;
-        conn.int_ep.submit(conn.int_ep.allocate(1024));
-        let comp = tokio::time::timeout(timeout, conn.int_ep.next_complete()).await
-            .map_err(|_| "Timeout waiting for interrupt from EP 0x83".to_string())?;
-        let buf = comp.into_result().map_err(|e| format!("USB Interrupt failed: {}", e))?;
-        Ok(buf.to_vec())
+        if conn.int_ep.pending() == 0 {
+            conn.int_ep.submit(conn.int_ep.allocate(1024));
+        }
+        let res = match tokio::time::timeout(timeout, conn.int_ep.next_complete()).await {
+            Err(_) => return Ok(None),
+            Ok(comp) => comp.into_result()
+                .map(|buf| buf.to_vec())
+                .map_err(|e| format!("USB Interrupt failed: {}", e)),
+        };
+        match res {
+            Ok(buf) => Ok(Some(buf)),
+            Err(e) => {
+                self.conn = None;
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn wait_int(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
+        self.poll_int(timeout).await?
+            .ok_or_else(|| "Timeout waiting for interrupt from EP 0x83".to_string())
     }
 
     pub async fn write_enable(&mut self) -> Result<(), String> {
@@ -557,22 +614,21 @@ impl SensorDriver {
                 "39f4010000f401000001ff002000000000ffff0000000000000000000000000020000000000000000000000000f401000000ff0020000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
             ).map_err(|e| e.to_string())?
         };
-        let _ = self.send_app_cmd(&cmd).await?;
+        // LED state is cosmetic: never reconnect just to change it.
+        let _ = self.send_app_cmd_once(&cmd).await?;
         Ok(())
     }
 
+    /// Abort whatever the sensor is doing and turn the LED off. Never reconnects.
     pub async fn cancel_current(&mut self) -> Result<(), String> {
-        let app_req_opt = if let Ok(conn) = self.get_conn_mut() {
-            conn.tls.make_app_data(&[0x04]).ok()
-        } else {
-            None
-        };
-        if let Some(app_req) = app_req_opt {
-            if let Ok(conn) = self.get_conn_mut() {
-                let _ = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(1)).await;
+        if let Some(conn) = self.conn.as_mut() {
+            if Self::exchange(conn, &[0x04], Duration::from_secs(1)).await.is_err() {
+                self.conn = None;
             }
         }
-        let _ = self.led_glow(false).await;
+        if self.conn.is_some() {
+            let _ = self.led_glow(false).await;
+        }
         Ok(())
     }
 
@@ -582,11 +638,14 @@ impl SensorDriver {
         mode: CaptureMode,
         cancel: &AtomicBool,
         timeout: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), CaptureError> {
         let cmd_02 = build_cmd_02(&self.calib_data, &self.calib_vals, mode);
         let rsp_02 = self.send_app_cmd(&cmd_02).await?;
         if rsp_02.len() >= 2 && LittleEndian::read_u16(&rsp_02[0..2]) != 0 {
-            return Err(format!("cmd_02 returned status 0x{:04x}", LittleEndian::read_u16(&rsp_02[0..2])));
+            return Err(CaptureError::Device(format!(
+                "cmd_02 returned status 0x{:04x}",
+                LittleEndian::read_u16(&rsp_02[0..2])
+            )));
         }
 
         // Wait for sensor start interrupt (type 0)
@@ -597,45 +656,39 @@ impl SensorDriver {
 
         let start_time = std::time::Instant::now();
 
-        // Wait for touch (interrupt type 2)
-        while start_time.elapsed() < timeout {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = self.cancel_current().await;
-                return Err("Capture cancelled".into());
-            }
-            if let Ok(b) = self.wait_int(Duration::from_millis(300)).await {
-                if !b.is_empty() && b[0] == 2 {
-                    break;
+        // Wait for touch (interrupt type 2), then capture complete (type 3 with b[2] & 4)
+        for stage in 0..2 {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = self.cancel_current().await;
+                    return Err(CaptureError::Cancelled);
+                }
+                if start_time.elapsed() >= timeout {
+                    let _ = self.cancel_current().await;
+                    return Err(CaptureError::Timeout);
+                }
+                // Device errors propagate immediately instead of spinning until the timeout
+                if let Some(b) = self.poll_int(Duration::from_millis(300)).await? {
+                    let done = if stage == 0 {
+                        !b.is_empty() && b[0] == 2
+                    } else {
+                        b.len() >= 3 && b[0] == 3 && (b[2] & 4) != 0
+                    };
+                    if done {
+                        break;
+                    }
                 }
             }
         }
 
-        if start_time.elapsed() >= timeout {
-            let _ = self.cancel_current().await;
-            return Err("Capture timed out waiting for finger touch".into());
-        }
-
-        // Wait for capture complete (interrupt type 3 with b[2] & 4)
-        while start_time.elapsed() < timeout {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = self.cancel_current().await;
-                return Err("Capture cancelled".into());
-            }
-            if let Ok(b) = self.wait_int(Duration::from_millis(300)).await {
-                if b.len() >= 3 && b[0] == 3 && (b[2] & 4) != 0 {
-                    break;
-                }
-            }
-        }
-
-        // Query PRG status2 (0x51)
-        let stat_rsp = self.send_app_cmd(&[0x51, 0x00, 0x20, 0x00, 0x00]).await?;
-        let _ = self.send_app_cmd(&[0x04]).await; // Stop capture
+        // Query PRG status2 (0x51). The capture lives in sensor RAM, so no reconnect/retry here.
+        let stat_rsp = self.send_app_cmd_once(&[0x51, 0x00, 0x20, 0x00, 0x00]).await?;
+        let _ = self.send_app_cmd_once(&[0x04]).await; // Stop capture
 
         if stat_rsp.len() >= 18 {
             let err = LittleEndian::read_u32(&stat_rsp[14..18]);
             if err != 0 {
-                return Err(format!("Sensor scanning problem error: 0x{:08x}", err));
+                return Err(CaptureError::ScanProblem(err));
             }
         }
 
@@ -644,18 +697,19 @@ impl SensorDriver {
 
     /// Match captured finger against on-chip database
     pub async fn match_finger(&mut self) -> Result<(u32, u16), String> {
+        // The captured image lives in sensor RAM; a reconnect would lose it, so no retries.
         let cmd = [0x5e, 2, 0xff, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
-        let _ = self.send_app_cmd(&cmd).await?;
+        let _ = self.send_app_cmd_once(&cmd).await?;
 
         let b = self.wait_int(Duration::from_secs(4)).await?;
         if b.is_empty() || b[0] != 3 {
-            let _ = self.send_app_cmd(&[0x62, 0, 0, 0, 0]).await;
+            let _ = self.send_app_cmd_once(&[0x62, 0, 0, 0, 0]).await;
             return Err("Finger not recognized".into());
         }
 
         // Query match results (0x60)
-        let rsp = self.send_app_cmd(&[0x60, 0, 0, 0, 0]).await?;
-        let _ = self.send_app_cmd(&[0x62, 0, 0, 0, 0]).await;
+        let rsp = self.send_app_cmd_once(&[0x60, 0, 0, 0, 0]).await?;
+        let _ = self.send_app_cmd_once(&[0x62, 0, 0, 0, 0]).await;
 
         if rsp.len() < 4 || LittleEndian::read_u16(&rsp[0..2]) != 0 {
             return Err("Failed to query match results".into());
@@ -696,8 +750,10 @@ impl SensorDriver {
         Ok(())
     }
 
+    // Enrollment state lives on the sensor and is lost on reconnect, so the remaining
+    // enrollment commands are never retried.
     pub async fn enrollment_update_end(&mut self) -> Result<(), String> {
-        let _ = self.send_app_cmd(&[0x69, 0, 0, 0, 0]).await?;
+        let _ = self.send_app_cmd_once(&[0x69, 0, 0, 0, 0]).await?;
         Ok(())
     }
 
@@ -706,7 +762,7 @@ impl SensorDriver {
         req.extend_from_slice(&key.to_le_bytes());
         req.extend_from_slice(&0u32.to_le_bytes());
 
-        let rsp = self.send_app_cmd(&req).await?;
+        let rsp = self.send_app_cmd_once(&req).await?;
         if rsp.len() < 6 || LittleEndian::read_u16(&rsp[0..2]) != 0 {
             return Err("enrollment_update_start failed".into());
         }
@@ -719,7 +775,7 @@ impl SensorDriver {
         self.write_enable().await?;
         let mut req = vec![0x6b];
         req.extend_from_slice(prev);
-        let res = self.send_app_cmd(&req).await;
+        let res = self.send_app_cmd_once(&req).await;
         let _ = self.call_cleanups().await;
         let rsp = res?;
         if rsp.len() < 2 || LittleEndian::read_u16(&rsp[0..2]) != 0 {
