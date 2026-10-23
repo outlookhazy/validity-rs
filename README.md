@@ -1,6 +1,6 @@
 # validity-rs
 
-A native Linux fingerprint daemon for Validity Sensors (`138a:0097` and `138a:0090`) commonly found on Lenovo ThinkPads (such as the X1 Carbon Gen 5).
+A native Linux fingerprint daemon for Validity Sensors (`138a:0097`) commonly found on Lenovo ThinkPads (such as the X1 Carbon Gen 5).
 
 `validity-rs` communicates directly with the sensor over USB and implements the standard `net.reactivated.Fprint` D-Bus interface, allowing standard desktop environments and PAM to interact with the device out of the box.
 
@@ -17,7 +17,6 @@ A native Linux fingerprint daemon for Validity Sensors (`138a:0097` and `138a:00
 ## Hardware Support
 
 - **138a:0097** (Tested on ThinkPad X1 Carbon Gen 5, Fedora 44)
-- **138a:0090** (Experimental)
 
 ## Installation
 
@@ -26,7 +25,7 @@ A native Linux fingerprint daemon for Validity Sensors (`138a:0097` and `138a:00
 Install the latest package directly from GitHub Releases:
 
 ```bash
-sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.1/validity-rs-0.1.1-1.fc44.x86_64.rpm
+sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.2/validity-rs-0.1.2-1.fc44.x86_64.rpm
 ```
 
 ### Building from Source

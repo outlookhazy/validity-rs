@@ -192,12 +192,16 @@ pub fn build_cmd_02(calib_data: &[u8], calib_vals: &[u8], mode: CaptureMode) -> 
     cmd
 }
 
+struct DeviceConnection {
+    interface: nusb::Interface,
+    out_ep: nusb::Endpoint<Bulk, Out>,
+    in_ep: nusb::Endpoint<Bulk, In>,
+    int_ep: nusb::Endpoint<Interrupt, In>,
+    tls: TlsSession,
+}
+
 pub struct SensorDriver {
-    pub interface: nusb::Interface,
-    pub out_ep: nusb::Endpoint<Bulk, Out>,
-    pub in_ep: nusb::Endpoint<Bulk, In>,
-    pub int_ep: nusb::Endpoint<Interrupt, In>,
-    pub tls: TlsSession,
+    conn: Option<DeviceConnection>,
     pub calib_data: Vec<u8>,
     pub calib_vals: Vec<u8>,
     pub stg_id: u16,
@@ -205,15 +209,31 @@ pub struct SensorDriver {
 
 impl SensorDriver {
     pub async fn open() -> Result<Self, String> {
-        Self::connect(Some(Duration::from_secs(5))).await
+        let (conn, calib_data, calib_vals, stg_id) = Self::connect(Some(Duration::from_secs(5))).await?;
+        Ok(Self {
+            conn: Some(conn),
+            calib_data,
+            calib_vals,
+            stg_id,
+        })
     }
 
     pub async fn reconnect(&mut self) -> Result<(), String> {
         eprintln!("Reconnecting sensor hardware...");
-        let new_driver = Self::connect(Some(Duration::from_secs(6))).await?;
-        *self = new_driver;
+        // Explicitly drop old endpoints and interface so kernel frees interface 0 immediately
+        drop(self.conn.take());
+
+        let (conn, calib_data, calib_vals, stg_id) = Self::connect(Some(Duration::from_secs(6))).await?;
+        self.conn = Some(conn);
+        self.calib_data = calib_data;
+        self.calib_vals = calib_vals;
+        self.stg_id = stg_id;
         eprintln!("Sensor hardware reconnected successfully! Windsor storage ID: {}", self.stg_id);
         Ok(())
+    }
+
+    fn get_conn_mut(&mut self) -> Result<&mut DeviceConnection, String> {
+        self.conn.as_mut().ok_or_else(|| "Sensor device not connected".to_string())
     }
 
     pub async fn ensure_connected(&mut self) -> Result<(), String> {
@@ -225,7 +245,7 @@ impl SensorDriver {
         Ok(())
     }
 
-    async fn connect(timeout: Option<Duration>) -> Result<Self, String> {
+    async fn connect(timeout: Option<Duration>) -> Result<(DeviceConnection, Vec<u8>, Vec<u8>, u16), String> {
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
         let start = std::time::Instant::now();
         let mut last_err = "Validity 138a:0097 sensor not found on USB bus".to_string();
@@ -419,16 +439,14 @@ impl SensorDriver {
 
             match init_res {
                 Ok((tls, calib_data, calib_vals, stg_id)) => {
-                    return Ok(Self {
+                    let conn = DeviceConnection {
                         interface: iface,
                         out_ep,
                         in_ep,
                         int_ep,
                         tls,
-                        calib_data,
-                        calib_vals,
-                        stg_id,
-                    });
+                    };
+                    return Ok((conn, calib_data, calib_vals, stg_id));
                 }
                 Err(e) => {
                     last_err = e;
@@ -458,44 +476,60 @@ impl SensorDriver {
         Ok(buf.to_vec())
     }
 
+    pub async fn send_app_cmd_once(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let app_req = {
+            let conn = self.get_conn_mut()?;
+            conn.tls.make_app_data(payload).map_err(|e| e.to_string())?
+        };
+        let conn = self.get_conn_mut()?;
+        let rsp = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(5)).await?;
+        let dec = conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
+        Ok(dec)
+    }
+
     pub async fn send_app_cmd(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
-        match Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await {
+        let app_req = {
+            let conn = self.get_conn_mut()?;
+            conn.tls.make_app_data(payload).map_err(|e| e.to_string())?
+        };
+        let raw_res = {
+            let conn = self.get_conn_mut()?;
+            Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(5)).await
+        };
+        match raw_res {
             Ok(rsp) => {
-                let parse_res = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string());
+                let parse_res = {
+                    let conn = self.get_conn_mut()?;
+                    conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())
+                };
                 match parse_res {
                     Ok(dec) => Ok(dec),
                     Err(msg) => {
                         eprintln!("TLS error ({}), attempting sensor reconnect...", msg);
                         self.reconnect().await?;
-                        let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
-                        let rsp = Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await?;
-                        let dec = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
-                        Ok(dec)
+                        self.send_app_cmd_once(payload).await
                     }
                 }
             }
             Err(msg) => {
                 eprintln!("USB I/O error ({}), attempting sensor reconnect...", msg);
                 self.reconnect().await?;
-                let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
-                let rsp = Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await?;
-                let dec = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
-                Ok(dec)
+                self.send_app_cmd_once(payload).await
             }
         }
     }
 
     pub async fn wait_int(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
-        self.int_ep.submit(self.int_ep.allocate(1024));
-        let comp = tokio::time::timeout(timeout, self.int_ep.next_complete()).await
+        let conn = self.get_conn_mut()?;
+        conn.int_ep.submit(conn.int_ep.allocate(1024));
+        let comp = tokio::time::timeout(timeout, conn.int_ep.next_complete()).await
             .map_err(|_| "Timeout waiting for interrupt from EP 0x83".to_string())?;
         let buf = comp.into_result().map_err(|e| format!("USB Interrupt failed: {}", e))?;
         Ok(buf.to_vec())
     }
 
     pub async fn write_enable(&mut self) -> Result<(), String> {
-        let rsp = self.send_app_cmd(DB_WRITE_ENABLE).await?;
+        let rsp = self.send_app_cmd_once(DB_WRITE_ENABLE).await?;
         if rsp.len() >= 2 && LittleEndian::read_u16(&rsp[0..2]) != 0 {
             return Err(format!("write_enable failed: 0x{:04x}", LittleEndian::read_u16(&rsp[0..2])));
         }
@@ -503,7 +537,7 @@ impl SensorDriver {
     }
 
     pub async fn call_cleanups(&mut self) -> Result<(), String> {
-        let rsp = self.send_app_cmd(&[0x1a]).await?;
+        let rsp = self.send_app_cmd_once(&[0x1a]).await?;
         if rsp.len() >= 2 {
             let err = LittleEndian::read_u16(&rsp[0..2]);
             if err != 0 && err != 0x0491 {
@@ -528,7 +562,16 @@ impl SensorDriver {
     }
 
     pub async fn cancel_current(&mut self) -> Result<(), String> {
-        let _ = self.send_app_cmd(&[0x04]).await;
+        let app_req_opt = if let Ok(conn) = self.get_conn_mut() {
+            conn.tls.make_app_data(&[0x04]).ok()
+        } else {
+            None
+        };
+        if let Some(app_req) = app_req_opt {
+            if let Ok(conn) = self.get_conn_mut() {
+                let _ = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, Duration::from_secs(1)).await;
+            }
+        }
         let _ = self.led_glow(false).await;
         Ok(())
     }
@@ -744,7 +787,7 @@ impl SensorDriver {
         req.extend_from_slice(&(data.len() as u16).to_le_bytes());
         req.extend_from_slice(data);
 
-        let res = self.send_app_cmd(&req).await;
+        let res = self.send_app_cmd_once(&req).await;
         let _ = self.call_cleanups().await;
         let rsp = res?;
 
@@ -788,14 +831,39 @@ impl SensorDriver {
         Ok(recid)
     }
 
-    pub async fn del_user(&mut self, user_dbid: u16) -> Result<(), String> {
+    pub async fn del_record(&mut self, recid: u16) -> Result<(), String> {
+        self.write_enable().await?;
         let mut req = vec![0x48];
-        req.extend_from_slice(&user_dbid.to_le_bytes());
-        let rsp = self.send_app_cmd(&req).await?;
+        req.extend_from_slice(&recid.to_le_bytes());
+        let res = self.send_app_cmd_once(&req).await;
+        let _ = self.call_cleanups().await;
+        let rsp = res?;
         if rsp.len() >= 2 && LittleEndian::read_u16(&rsp[0..2]) != 0 {
-            return Err(format!("del_user failed: 0x{:04x}", LittleEndian::read_u16(&rsp[0..2])));
+            return Err(format!("del_record failed: 0x{:04x}", LittleEndian::read_u16(&rsp[0..2])));
         }
         Ok(())
+    }
+
+    pub async fn del_finger(&mut self, uid: u32, subtype: u16) -> Result<bool, String> {
+        let user_info = match self.lookup_user(uid).await? {
+            Some(u) => u,
+            None => return Ok(false),
+        };
+        for f in &user_info.fingers {
+            if f.subtype == subtype {
+                self.del_record(f.dbid).await?;
+                // If this was the user's only enrolled finger, remove the user record too
+                if user_info.fingers.len() == 1 {
+                    let _ = self.del_record(user_info.dbid).await;
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn del_user(&mut self, user_dbid: u16) -> Result<(), String> {
+        self.del_record(user_dbid).await
     }
 
     pub async fn list_enrolled_fingers(&mut self, uid: u32) -> Result<Vec<String>, String> {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Validity Fingerprint Authentication Daemon (Pure Rust)
+Description=Validity Fingerprint Authentication Daemon
 Documentation=https://github.com/outlookhazy/validity-rs
 Conflicts=fprintd.service
 
@@ -11,6 +11,7 @@ Restart=on-failure
 RestartSec=1s
 
 # Sandboxing and security
+NoNewPrivileges=true
 ProtectSystem=strict
 ProtectKernelTunables=true
 ProtectControlGroups=true

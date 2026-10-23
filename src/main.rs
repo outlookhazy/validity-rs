@@ -7,18 +7,8 @@ mod tls;
 
 use std::sync::Arc;
 use dbus::{FprintDevice, FprintManager};
-use sensor::SensorDriver;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Validity 138a:0097 Fingerprint Daemon (Rust) ===");
-    println!("Initializing sensor hardware...");
-
-    let driver = SensorDriver::open().await
-        .map_err(|e| format!("Failed to initialize sensor: {}", e))?;
-    println!("Sensor initialized! Windsor storage ID: {}", driver.stg_id);
-
 use futures_util::StreamExt;
+use sensor::SensorDriver;
 
 #[zbus::proxy(
     default_service = "org.freedesktop.login1",
@@ -29,6 +19,15 @@ trait Login1Manager {
     #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
 }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Validity 138a:0097 Fingerprint Daemon ===");
+    println!("Initializing sensor hardware...");
+
+    let driver = SensorDriver::open().await
+        .map_err(|e| format!("Failed to initialize sensor: {}", e))?;
+    println!("Sensor initialized! Windsor storage ID: {}", driver.stg_id);
 
     let driver_arc = Arc::new(tokio::sync::Mutex::new(driver));
     let device_path: zbus::OwnedObjectPath = "/net/reactivated/Fprint/Device/0".try_into()?;
@@ -67,9 +66,8 @@ trait Login1Manager {
         }
     }
 
-
     println!("Daemon running! D-Bus service net.reactivated.Fprint is live.");
-    println!("Ready for: PAM, fprintd-enroll, fprintd-verify, fprintd-delete, KDE Plasma 6.");
+    println!("Ready for authentication requests.");
 
     tokio::signal::ctrl_c().await?;
     println!("\nReceived shutdown signal. Exiting daemon.");

@@ -435,11 +435,8 @@ impl TlsSession {
         let mut mac = HmacSha256::new_from_slice(&self.validation_key)?;
         mac.update(&hdr);
         mac.update(payload);
-        let expected_sig = mac.finalize().into_bytes();
-
-        if expected_sig.as_slice() != sig {
-            return Err("TLS record signature validation check failed".into());
-        }
+        mac.verify_slice(sig)
+            .map_err(|_| "TLS record signature validation check failed")?;
 
         Ok(payload.to_vec())
     }

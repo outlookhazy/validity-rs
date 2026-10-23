@@ -107,14 +107,11 @@ pub fn decrypt_host_priv_key(hw: &HwKeys, body: &[u8]) -> Result<DecryptedPrivKe
 
     let (c, hs) = rest.split_at(rest.len() - 0x20);
 
-    // Verify HMAC-SHA256 signature
+    // Verify HMAC-SHA256 signature in constant time
     let mut mac = HmacSha256::new_from_slice(&hw.psk_validation_key)?;
     mac.update(c);
-    let expected_sig = mac.finalize().into_bytes();
-
-    if expected_sig.as_slice() != hs {
-        return Err("Signature check failed! Sensor flash was likely paired with another machine or Windows.".into());
-    }
+    mac.verify_slice(hs)
+        .map_err(|_| "Signature check failed! Sensor flash was likely paired with another machine or Windows.")?;
 
     let (iv, ciphertext) = c.split_at(0x10);
 

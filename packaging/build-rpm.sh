@@ -18,8 +18,6 @@ cargo build --release
 RPM_DIR="$DIR/target/rpmbuild"
 rm -rf "$RPM_DIR"
 mkdir -p "$RPM_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-mkdir -p "$RPM_DIR/BUILD/validity-rs-0.1.0-build"
-cp LICENSE "$RPM_DIR/BUILD/validity-rs-0.1.0-build/"
 
 cp packaging/validity-rs.spec "$RPM_DIR/SPECS/"
 

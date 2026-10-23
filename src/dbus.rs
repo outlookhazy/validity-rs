@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use zbus::fdo::DBusProxy;
 use zbus::object_server::SignalEmitter;
 use zbus::OwnedObjectPath;
 use zbus::{interface, DBusError};
@@ -26,14 +27,51 @@ pub fn username_to_uid(username: &str) -> Option<u32> {
     if username.is_empty() {
         return None;
     }
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in passwd.lines() {
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() >= 3 && parts[0] == username {
-            return parts[2].parse().ok();
+    let c_user = std::ffi::CString::new(username).ok()?;
+    let pwd = unsafe { libc::getpwnam(c_user.as_ptr()) };
+    if pwd.is_null() {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        for line in passwd.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 && parts[0] == username {
+                return parts[2].parse().ok();
+            }
         }
+        None
+    } else {
+        Some(unsafe { (*pwd).pw_uid as u32 })
     }
-    None
+}
+
+pub fn uid_to_username(uid: u32) -> Option<String> {
+    let pwd = unsafe { libc::getpwuid(uid as libc::uid_t) };
+    if pwd.is_null() {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        for line in passwd.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 && parts[2].parse::<u32>().ok() == Some(uid) {
+                return Some(parts[0].to_string());
+            }
+        }
+        None
+    } else {
+        let name = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
+        name.to_str().ok().map(|s| s.to_string())
+    }
+}
+
+async fn get_caller_info(
+    conn: &zbus::Connection,
+    hdr: &zbus::message::Header<'_>,
+) -> Result<(String, u32), FprintError> {
+    let sender = hdr.sender().ok_or_else(|| FprintError::PermissionDenied("No message sender".into()))?;
+    let dbus = DBusProxy::new(conn).await
+        .map_err(|e| FprintError::Internal(format!("Failed to connect to D-Bus daemon: {}", e)))?;
+    let bus_name = zbus::names::BusName::try_from(sender.as_str())
+        .map_err(|e| FprintError::Internal(format!("Invalid bus name: {}", e)))?;
+    let uid = dbus.get_connection_unix_user(bus_name).await
+        .map_err(|e| FprintError::PermissionDenied(format!("Failed to get caller UID: {}", e)))?;
+    Ok((sender.as_str().to_string(), uid))
 }
 
 pub struct FprintManager {
@@ -51,10 +89,17 @@ impl FprintManager {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Claim {
+    pub sender: String,
+    pub username: String,
+    pub uid: u32,
+}
+
 pub struct FprintDevice {
     pub driver: Arc<Mutex<SensorDriver>>,
-    pub claimed_by: Arc<std::sync::Mutex<Option<String>>>,
-    pub cancel_flag: Arc<AtomicBool>,
+    pub claimed_by: Arc<std::sync::Mutex<Option<Claim>>>,
+    pub current_cancel: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl FprintDevice {
@@ -62,7 +107,7 @@ impl FprintDevice {
         Self {
             driver,
             claimed_by: Arc::new(std::sync::Mutex::new(None)),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            current_cancel: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -72,7 +117,7 @@ impl FprintDevice {
     // --- Properties ---
     #[zbus(property, name = "name")]
     async fn name(&self) -> String {
-        "Validity VFS0097 Fingerprint Reader (Rust)".to_string()
+        "Validity VFS0097 Fingerprint Reader".to_string()
     }
 
     #[zbus(property, name = "num-enroll-stages")]
@@ -112,27 +157,63 @@ impl FprintDevice {
     ) -> zbus::Result<()>;
 
     // --- Methods ---
-    async fn claim(&self, username: &str) -> Result<(), FprintError> {
-        let mut claimed = self.claimed_by.lock().unwrap();
-        let target_user = if username.is_empty() {
-            "cgalant".to_string()
+    async fn claim(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        username: &str,
+    ) -> Result<(), FprintError> {
+        let (caller_sender, caller_uid) = get_caller_info(conn, &hdr).await?;
+        let (target_user, target_uid) = if username.is_empty() {
+            let u = uid_to_username(caller_uid)
+                .ok_or_else(|| FprintError::Internal(format!("Cannot resolve username for caller UID {}", caller_uid)))?;
+            (u, caller_uid)
         } else {
-            username.to_string()
+            let uid = username_to_uid(username)
+                .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", username)))?;
+            (username.to_string(), uid)
         };
-        if let Some(ref current) = *claimed {
-            if current != &target_user {
+
+        if caller_uid != 0 && caller_uid != target_uid {
+            return Err(FprintError::PermissionDenied(format!(
+                "Caller UID {} is not authorized to claim device for user {}",
+                caller_uid, target_user
+            )));
+        }
+
+        let mut claim_guard = self.claimed_by.lock().unwrap();
+        if let Some(ref current) = *claim_guard {
+            if current.sender != caller_sender || current.uid != target_uid {
                 return Err(FprintError::AlreadyInUse("Device is already claimed".into()));
             }
         }
-        *claimed = Some(target_user);
-        self.cancel_flag.store(false, Ordering::Relaxed);
+
+        *claim_guard = Some(Claim {
+            sender: caller_sender,
+            username: target_user,
+            uid: target_uid,
+        });
         Ok(())
     }
 
-    async fn release(&self) -> Result<(), FprintError> {
-        let mut claimed = self.claimed_by.lock().unwrap();
-        *claimed = None;
-        self.cancel_flag.store(true, Ordering::Relaxed);
+    async fn release(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(), FprintError> {
+        let (caller_sender, caller_uid) = get_caller_info(conn, &hdr).await?;
+        let mut claim_guard = self.claimed_by.lock().unwrap();
+        if let Some(ref current) = *claim_guard {
+            if caller_uid != 0 && current.sender != caller_sender {
+                return Err(FprintError::PermissionDenied("Cannot release device claimed by another caller".into()));
+            }
+        }
+        *claim_guard = None;
+
+        if let Some(cancel) = self.current_cancel.lock().unwrap().take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
         let driver = self.driver.clone();
         tokio::spawn(async move {
             let mut d = driver.lock().await;
@@ -142,14 +223,26 @@ impl FprintDevice {
         Ok(())
     }
 
-    async fn list_enrolled_fingers(&self, username: &str) -> Result<Vec<String>, FprintError> {
-        let target_user = if username.is_empty() { "cgalant" } else { username };
-        let uid = username_to_uid(target_user)
-            .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", target_user)))?;
+    async fn list_enrolled_fingers(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        username: &str,
+    ) -> Result<Vec<String>, FprintError> {
+        let (_caller_sender, caller_uid) = get_caller_info(conn, &hdr).await?;
+        let (target_user, target_uid) = if username.is_empty() {
+            let u = uid_to_username(caller_uid)
+                .ok_or_else(|| FprintError::Internal(format!("Cannot resolve username for caller UID {}", caller_uid)))?;
+            (u, caller_uid)
+        } else {
+            let uid = username_to_uid(username)
+                .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", username)))?;
+            (username.to_string(), uid)
+        };
 
         let mut driver = self.driver.lock().await;
         driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
-        let fingers = driver.list_enrolled_fingers(uid).await
+        let fingers = driver.list_enrolled_fingers(target_uid).await
             .map_err(|e| FprintError::Internal(e.to_string()))?;
 
         if fingers.is_empty() {
@@ -158,33 +251,68 @@ impl FprintDevice {
         Ok(fingers)
     }
 
-    async fn delete_enrolled_fingers(&self, username: &str) -> Result<(), FprintError> {
-        let target_user = if username.is_empty() { "cgalant" } else { username };
-        let uid = username_to_uid(target_user)
-            .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", target_user)))?;
+    async fn delete_enrolled_fingers(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        username: &str,
+    ) -> Result<(), FprintError> {
+        let (_caller_sender, caller_uid) = get_caller_info(conn, &hdr).await?;
+        let (target_user, target_uid) = if username.is_empty() {
+            let u = uid_to_username(caller_uid)
+                .ok_or_else(|| FprintError::Internal(format!("Cannot resolve username for caller UID {}", caller_uid)))?;
+            (u, caller_uid)
+        } else {
+            let uid = username_to_uid(username)
+                .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", username)))?;
+            (username.to_string(), uid)
+        };
+
+        if caller_uid != 0 && caller_uid != target_uid {
+            return Err(FprintError::PermissionDenied(format!(
+                "Caller UID {} is not authorized to delete prints for user {}",
+                caller_uid, target_user
+            )));
+        }
 
         let mut driver = self.driver.lock().await;
         driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
-        if let Some(user_info) = driver.lookup_user(uid).await.map_err(|e| FprintError::Internal(e.to_string()))? {
+        if let Some(user_info) = driver.lookup_user(target_uid).await.map_err(|e| FprintError::Internal(e.to_string()))? {
             driver.del_user(user_info.dbid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
         }
         Ok(())
     }
 
     async fn delete_enrolled_fingers2(&self) -> Result<(), FprintError> {
-        let username = {
+        let claim = {
             let claimed = self.claimed_by.lock().unwrap();
             claimed.clone().ok_or_else(|| FprintError::ClaimDevice("Client must claim device first".into()))?
         };
-        self.delete_enrolled_fingers(&username).await
+
+        let mut driver = self.driver.lock().await;
+        driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
+        if let Some(user_info) = driver.lookup_user(claim.uid).await.map_err(|e| FprintError::Internal(e.to_string()))? {
+            driver.del_user(user_info.dbid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    async fn delete_enrolled_finger(&self, _finger_name: &str) -> Result<(), FprintError> {
-        let username = {
+    async fn delete_enrolled_finger(&self, finger_name: &str) -> Result<(), FprintError> {
+        let claim = {
             let claimed = self.claimed_by.lock().unwrap();
             claimed.clone().ok_or_else(|| FprintError::ClaimDevice("Client must claim device first".into()))?
         };
-        self.delete_enrolled_fingers(&username).await
+        let subtype = finger_name_to_id(finger_name)
+            .ok_or_else(|| FprintError::Internal(format!("Unknown finger name: {}", finger_name)))?;
+
+        let mut driver = self.driver.lock().await;
+        driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
+        let deleted = driver.del_finger(claim.uid, subtype).await
+            .map_err(|e| FprintError::Internal(e.to_string()))?;
+        if !deleted {
+            return Err(FprintError::Internal(format!("Finger {} was not enrolled", finger_name)));
+        }
+        Ok(())
     }
 
     async fn verify_start(
@@ -192,32 +320,36 @@ impl FprintDevice {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         finger_name: &str,
     ) -> Result<(), FprintError> {
-        let username = {
+        let claim = {
             let claimed = self.claimed_by.lock().unwrap();
             claimed.clone().ok_or_else(|| FprintError::ClaimDevice("Client must claim device first".into()))?
         };
-
-        let uid = username_to_uid(&username)
-            .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", username)))?;
 
         // Synchronously verify user has enrolled prints
         {
             let mut d = self.driver.lock().await;
             d.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
-            let user_info = d.lookup_user(uid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
+            let user_info = d.lookup_user(claim.uid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
             match user_info {
                 Some(u) if !u.fingers.is_empty() => (),
                 _ => {
-                    return Err(FprintError::NoEnrolledPrints(format!("No enrolled prints for user {}", username)));
+                    return Err(FprintError::NoEnrolledPrints(format!("No enrolled prints for user {}", claim.username)));
                 }
             }
         }
 
-        self.cancel_flag.store(false, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut c_guard = self.current_cancel.lock().unwrap();
+            if let Some(old) = c_guard.replace(cancel.clone()) {
+                old.store(true, Ordering::Relaxed);
+            }
+        }
+
         let driver = self.driver.clone();
-        let cancel = self.cancel_flag.clone();
         let emitter_clone = emitter.to_owned();
         let selected_finger = if finger_name.is_empty() { "any" } else { finger_name }.to_string();
+        let uid = claim.uid;
 
         tokio::spawn(async move {
             // Give D-Bus method reply a moment to reach PAM so data->verify_started = true
@@ -244,7 +376,8 @@ impl FprintDevice {
                         // Capture succeeded, match against on-chip database
                         match d.match_finger().await {
                             Ok((matched_uid, _subtype)) => {
-                                if matched_uid == uid || matched_uid == (user_info.dbid as u32) {
+                                // Tag 1 returned by the chip is the Windsor user record dbid
+                                if matched_uid == (user_info.dbid as u32) {
                                     let _ = d.led_glow(false).await;
                                     let _ = Self::verify_status(&emitter_clone, "verify-match", true).await;
                                     break;
@@ -297,7 +430,9 @@ impl FprintDevice {
     }
 
     async fn verify_stop(&self) -> Result<(), FprintError> {
-        self.cancel_flag.store(true, Ordering::Relaxed);
+        if let Some(cancel) = self.current_cancel.lock().unwrap().take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         let driver = self.driver.clone();
         tokio::spawn(async move {
             let mut d = driver.lock().await;
@@ -311,13 +446,10 @@ impl FprintDevice {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         finger_name: &str,
     ) -> Result<(), FprintError> {
-        let username = {
+        let claim = {
             let claimed = self.claimed_by.lock().unwrap();
             claimed.clone().ok_or_else(|| FprintError::ClaimDevice("Client must claim device first".into()))?
         };
-
-        let uid = username_to_uid(&username)
-            .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", username)))?;
 
         let subtype = finger_name_to_id(finger_name)
             .unwrap_or(2); // default right-index-finger
@@ -327,10 +459,17 @@ impl FprintDevice {
             d.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
         }
 
-        self.cancel_flag.store(false, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut c_guard = self.current_cancel.lock().unwrap();
+            if let Some(old) = c_guard.replace(cancel.clone()) {
+                old.store(true, Ordering::Relaxed);
+            }
+        }
+
         let driver = self.driver.clone();
-        let cancel = self.cancel_flag.clone();
         let emitter_clone = emitter.to_owned();
+        let uid = claim.uid;
 
         tokio::spawn(async move {
             let mut d = driver.lock().await;
@@ -426,7 +565,9 @@ impl FprintDevice {
     }
 
     async fn enroll_stop(&self) -> Result<(), FprintError> {
-        self.cancel_flag.store(true, Ordering::Relaxed);
+        if let Some(cancel) = self.current_cancel.lock().unwrap().take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         let driver = self.driver.clone();
         tokio::spawn(async move {
             let mut d = driver.lock().await;
