@@ -1,0 +1,25 @@
+[Unit]
+Description=Validity Fingerprint Authentication Daemon (Pure Rust)
+Documentation=https://github.com/cgalant/validity-rs
+Conflicts=fprintd.service
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/libexec/validity-rs --daemon
+Restart=on-failure
+RestartSec=1s
+
+# Sandboxing and security
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+PrivateTmp=true
+ProtectHome=true
+
+# Device access for USB fingerprint reader
+DeviceAllow=char-usb_device rw
+ReadWritePaths=/sys/devices
+
+[Install]
+WantedBy=multi-user.target
