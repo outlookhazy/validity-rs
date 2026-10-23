@@ -1,10 +1,11 @@
 Name:           validity-rs
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Pure-Rust native fingerprint authentication daemon for Validity sensors (138a:0097)
 
 License:        MIT
-URL:            https://github.com/cgalant/validity-rs
+URL:            https://github.com/outlookhazy/validity-rs
+
 
 BuildRequires:  rust
 BuildRequires:  cargo
@@ -48,5 +49,9 @@ install -D -p -m 0644 %{_sourcedir}/packaging/70-validity.rules $RPM_BUILD_ROOT%
 %{_udevrulesdir}/70-validity.rules
 
 %changelog
+* Fri Oct 23 2026 cgalant - 0.1.1-1
+- Add automatic reconnection and logind PrepareForSleep resume handling
+- Fix device disconnected error across suspend/sleep cycles
+
 * Thu Oct 22 2026 cgalant - 0.1.0-1
 - Initial release with pure-Rust TLS 1.2 engine and D-Bus integration

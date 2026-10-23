@@ -148,6 +148,7 @@ impl FprintDevice {
             .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", target_user)))?;
 
         let mut driver = self.driver.lock().await;
+        driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
         let fingers = driver.list_enrolled_fingers(uid).await
             .map_err(|e| FprintError::Internal(e.to_string()))?;
 
@@ -163,6 +164,7 @@ impl FprintDevice {
             .ok_or_else(|| FprintError::Internal(format!("Unknown user: {}", target_user)))?;
 
         let mut driver = self.driver.lock().await;
+        driver.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
         if let Some(user_info) = driver.lookup_user(uid).await.map_err(|e| FprintError::Internal(e.to_string()))? {
             driver.del_user(user_info.dbid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
         }
@@ -201,6 +203,7 @@ impl FprintDevice {
         // Synchronously verify user has enrolled prints
         {
             let mut d = self.driver.lock().await;
+            d.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
             let user_info = d.lookup_user(uid).await.map_err(|e| FprintError::Internal(e.to_string()))?;
             match user_info {
                 Some(u) if !u.fingers.is_empty() => (),
@@ -318,6 +321,11 @@ impl FprintDevice {
 
         let subtype = finger_name_to_id(finger_name)
             .unwrap_or(2); // default right-index-finger
+
+        {
+            let mut d = self.driver.lock().await;
+            d.ensure_connected().await.map_err(|e| FprintError::Internal(e.to_string()))?;
+        }
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let driver = self.driver.clone();

@@ -205,159 +205,239 @@ pub struct SensorDriver {
 
 impl SensorDriver {
     pub async fn open() -> Result<Self, String> {
-        let mut dev_info = None;
-        let devices = nusb::list_devices().await
-            .map_err(|e| format!("USB list failed: {}", e))?;
-        for d in devices {
-            if d.vendor_id() == 0x138a && d.product_id() == 0x0097 {
-                dev_info = Some(d);
-                break;
-            }
+        Self::connect(Some(Duration::from_secs(5))).await
+    }
+
+    pub async fn reconnect(&mut self) -> Result<(), String> {
+        eprintln!("Reconnecting sensor hardware...");
+        let new_driver = Self::connect(Some(Duration::from_secs(6))).await?;
+        *self = new_driver;
+        eprintln!("Sensor hardware reconnected successfully! Windsor storage ID: {}", self.stg_id);
+        Ok(())
+    }
+
+    pub async fn ensure_connected(&mut self) -> Result<(), String> {
+        // Quick probe: query sensor hardware type (0x75)
+        if let Err(e) = self.send_app_cmd(&[0x75]).await {
+            eprintln!("Sensor connection check failed ({}), attempting reconnect...", e);
+            self.reconnect().await?;
         }
-        let di = dev_info.ok_or_else(|| "Validity 138a:0097 sensor not found on USB bus".to_string())?;
-        let dev = di.open().await
-            .map_err(|e| format!("Failed to open USB device: {}", e))?;
-        let iface = dev.claim_interface(0).await
-            .map_err(|e| format!("Failed to claim interface 0: {}", e))?;
+        Ok(())
+    }
 
-        let mut out_ep = iface.endpoint::<Bulk, Out>(0x01)
-            .map_err(|e| format!("Failed to claim EP 0x01: {}", e))?;
-        let mut in_ep = iface.endpoint::<Bulk, In>(0x81)
-            .map_err(|e| format!("Failed to claim EP 0x81: {}", e))?;
-        let int_ep = iface.endpoint::<Interrupt, In>(0x83)
-            .map_err(|e| format!("Failed to claim EP 0x83: {}", e))?;
+    async fn connect(timeout: Option<Duration>) -> Result<Self, String> {
+        let timeout = timeout.unwrap_or(Duration::from_secs(5));
+        let start = std::time::Instant::now();
+        let mut last_err = "Validity 138a:0097 sensor not found on USB bus".to_string();
 
-        // Drain any leftover pending data
-        in_ep.submit(in_ep.allocate(64 * 1024));
-        let _ = tokio::time::timeout(Duration::from_millis(50), in_ep.next_complete()).await;
-
-        // 1. Ping / initialization
-        let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x01], Duration::from_secs(3)).await?;
-        let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x19], Duration::from_secs(3)).await?;
-        let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x43, 0x02], Duration::from_secs(3)).await?;
-        let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, INIT_HARDCODED, Duration::from_secs(5)).await?;
-
-        // 2. Read Partition 1
-        let mut read_p1_cmd = Vec::new();
-        read_p1_cmd.push(0x40); // Read flash
-        read_p1_cmd.push(0x01); // Partition 1
-        read_p1_cmd.push(0x01); // 1
-        read_p1_cmd.extend_from_slice(&0u16.to_le_bytes()); // 0
-        read_p1_cmd.extend_from_slice(&0u32.to_le_bytes()); // addr = 0
-        read_p1_cmd.extend_from_slice(&0x1000u32.to_le_bytes()); // size = 4096
-
-        let p1_rsp = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &read_p1_cmd, Duration::from_secs(5)).await?;
-        if p1_rsp.len() < 10 {
-            return Err("Partition 1 read truncated".into());
-        }
-
-        let hw = HwKeys::load();
-        let mut host_priv = None;
-        let mut device_ecdh = None;
-        let mut tls_cert = Vec::new();
-
-        let mut data = &p1_rsp[8..];
-        while data.len() >= 36 {
-            let id = LittleEndian::read_u16(&data[0..2]);
-            let len = LittleEndian::read_u16(&data[2..4]) as usize;
-            data = &data[36..];
-            if id == 0xffff || len > data.len() {
-                break;
-            }
-            let body = &data[..len];
-            data = &data[len..];
-
-            match id {
-                3 => {
-                    tls_cert = body.to_vec();
+        while start.elapsed() < timeout {
+            let devices = match nusb::list_devices().await {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = format!("USB list failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
                 }
-                4 => {
-                    if let Ok(k) = decrypt_host_priv_key(&hw, body) {
-                        host_priv = Some(k);
+            };
+
+            let mut dev_info = None;
+            for d in devices {
+                if d.vendor_id() == 0x138a && d.product_id() == 0x0097 {
+                    dev_info = Some(d);
+                    break;
+                }
+            }
+
+            let di = match dev_info {
+                Some(di) => di,
+                None => {
+                    last_err = "Validity 138a:0097 sensor not found on USB bus".to_string();
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            let dev = match di.open().await {
+                Ok(dev) => dev,
+                Err(e) => {
+                    last_err = format!("Failed to open USB device: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            let iface = match dev.claim_interface(0).await {
+                Ok(iface) => iface,
+                Err(e) => {
+                    last_err = format!("Failed to claim interface 0: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            let mut out_ep = match iface.endpoint::<Bulk, Out>(0x01) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    last_err = format!("Failed to claim EP 0x01: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            let mut in_ep = match iface.endpoint::<Bulk, In>(0x81) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    last_err = format!("Failed to claim EP 0x81: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            let int_ep = match iface.endpoint::<Interrupt, In>(0x83) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    last_err = format!("Failed to claim EP 0x83: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            // Drain any leftover pending data
+            in_ep.submit(in_ep.allocate(64 * 1024));
+            let _ = tokio::time::timeout(Duration::from_millis(50), in_ep.next_complete()).await;
+
+            let init_res: Result<(TlsSession, Vec<u8>, Vec<u8>, u16), String> = async {
+                // 1. Ping / initialization
+                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x01], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x19], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x43, 0x02], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, INIT_HARDCODED, Duration::from_secs(5)).await?;
+
+                // 2. Read Partition 1
+                let mut read_p1_cmd = Vec::new();
+                read_p1_cmd.push(0x40); // Read flash
+                read_p1_cmd.push(0x01); // Partition 1
+                read_p1_cmd.push(0x01); // 1
+                read_p1_cmd.extend_from_slice(&0u16.to_le_bytes()); // 0
+                read_p1_cmd.extend_from_slice(&0u32.to_le_bytes()); // addr = 0
+                read_p1_cmd.extend_from_slice(&0x1000u32.to_le_bytes()); // size = 4096
+
+                let p1_rsp = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &read_p1_cmd, Duration::from_secs(5)).await?;
+                if p1_rsp.len() < 10 {
+                    return Err("Partition 1 read truncated".into());
+                }
+
+                let hw = HwKeys::load();
+                let mut host_priv = None;
+                let mut device_ecdh = None;
+                let mut tls_cert = Vec::new();
+
+                let mut data = &p1_rsp[8..];
+                while data.len() >= 36 {
+                    let id = LittleEndian::read_u16(&data[0..2]);
+                    let len = LittleEndian::read_u16(&data[2..4]) as usize;
+                    data = &data[36..];
+                    if id == 0xffff || len > data.len() {
+                        break;
+                    }
+                    let body = &data[..len];
+                    data = &data[len..];
+
+                    match id {
+                        3 => tls_cert = body.to_vec(),
+                        4 => if let Ok(k) = decrypt_host_priv_key(&hw, body) { host_priv = Some(k); },
+                        6 => if let Ok(k) = DeviceEcdhKey::parse(body) { device_ecdh = Some(k); },
+                        _ => {}
                     }
                 }
-                6 => {
-                    if let Ok(k) = DeviceEcdhKey::parse(body) {
-                        device_ecdh = Some(k);
+
+                let host_key = host_priv.ok_or_else(|| "Failed to decrypt host private key".to_string())?;
+                let dev_key = device_ecdh.ok_or_else(|| "Failed to parse device ECDH key".to_string())?;
+
+                // 3. TLS 1.2 Handshake
+                let mut tls = TlsSession::new();
+                let client_hello = tls.make_client_hello();
+                let rsp_sh = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &client_hello, Duration::from_secs(10)).await?;
+                tls.parse_tls_response(&rsp_sh).map_err(|e| e.to_string())?;
+
+                let finish_pkt = tls.make_keys_and_finish(&dev_key, &host_key, &tls_cert)
+                    .map_err(|e| e.to_string())?;
+                let rsp_fin = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &finish_pkt, Duration::from_secs(10)).await?;
+                tls.parse_tls_response(&rsp_fin).map_err(|e| e.to_string())?;
+
+                // 4. Query Windsor Storage record ID
+                let mut stg_cmd = vec![0x4b];
+                stg_cmd.extend_from_slice(&0u16.to_le_bytes()); // dbid = 0
+                let stg_name = b"StgWindsor\0";
+                stg_cmd.extend_from_slice(&(stg_name.len() as u16).to_le_bytes());
+                stg_cmd.extend_from_slice(stg_name);
+
+                let app_stg = tls.make_app_data(&stg_cmd).map_err(|e| e.to_string())?;
+                let rsp_stg = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_stg, Duration::from_secs(5)).await?;
+                let dec_stg = tls.parse_tls_response(&rsp_stg).map_err(|e| e.to_string())?;
+                let stg = parse_user_storage(&dec_stg)?
+                    .ok_or_else(|| "StgWindsor storage not initialized on sensor".to_string())?;
+                let stg_id = stg.dbid;
+
+                // 5. Query Sensor Hardware Type (0x75)
+                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &tls.make_app_data(&[0x75]).map_err(|e| e.to_string())?, Duration::from_secs(5)).await?;
+
+                // 6. Query Factory Bits (0x6f, tag 0x0e00)
+                let mut calib_data = Vec::new();
+                let mut calib_vals = Vec::new();
+                let mut fb_cmd = vec![0x6f];
+                fb_cmd.extend_from_slice(&0x0e00u16.to_le_bytes());
+                fb_cmd.extend_from_slice(&0u16.to_le_bytes());
+                fb_cmd.extend_from_slice(&0u32.to_le_bytes());
+                let app_fb = tls.make_app_data(&fb_cmd).map_err(|e| e.to_string())?;
+                let rsp_fb = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_fb, Duration::from_secs(5)).await?;
+                let dec_fb = tls.parse_tls_response(&rsp_fb).map_err(|e| e.to_string())?;
+
+                let entries = if dec_fb.len() >= 10 { LittleEndian::read_u32(&dec_fb[6..10]) as usize } else { 0 };
+                let mut fb_ptr = &dec_fb[10..];
+                for _ in 0..entries {
+                    if fb_ptr.len() < 12 { break; }
+                    let len = LittleEndian::read_u16(&fb_ptr[4..6]) as usize;
+                    let subtag = LittleEndian::read_u16(&fb_ptr[8..10]);
+                    fb_ptr = &fb_ptr[12..];
+                    if len > fb_ptr.len() { break; }
+                    let val = &fb_ptr[..len];
+                    fb_ptr = &fb_ptr[len..];
+                    if subtag == 3 && calib_vals.is_empty() && val.len() >= 4 {
+                        calib_vals = val[4..].to_vec();
+                    } else if subtag == 7 && calib_data.is_empty() && val.len() >= 4 {
+                        calib_data = val[4..].to_vec();
                     }
                 }
-                _ => {}
+
+                if calib_data.is_empty() || calib_vals.is_empty() {
+                    return Err("Failed to extract sensor calibration factory bits".into());
+                }
+
+                Ok((tls, calib_data, calib_vals, stg_id))
+            }.await;
+
+            match init_res {
+                Ok((tls, calib_data, calib_vals, stg_id)) => {
+                    return Ok(Self {
+                        interface: iface,
+                        out_ep,
+                        in_ep,
+                        int_ep,
+                        tls,
+                        calib_data,
+                        calib_vals,
+                        stg_id,
+                    });
+                }
+                Err(e) => {
+                    last_err = e;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
             }
         }
 
-        let host_key = host_priv.ok_or_else(|| "Failed to decrypt host private key".to_string())?;
-        let dev_key = device_ecdh.ok_or_else(|| "Failed to parse device ECDH key".to_string())?;
-
-        // 3. TLS 1.2 Handshake
-        let mut tls = TlsSession::new();
-        let client_hello = tls.make_client_hello();
-        let rsp_sh = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &client_hello, Duration::from_secs(10)).await?;
-        tls.parse_tls_response(&rsp_sh).map_err(|e| e.to_string())?;
-
-        let finish_pkt = tls.make_keys_and_finish(&dev_key, &host_key, &tls_cert)
-            .map_err(|e| e.to_string())?;
-        let rsp_fin = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &finish_pkt, Duration::from_secs(10)).await?;
-        tls.parse_tls_response(&rsp_fin).map_err(|e| e.to_string())?;
-
-        // 4. Query Windsor Storage record ID
-        let mut stg_cmd = vec![0x4b];
-        stg_cmd.extend_from_slice(&0u16.to_le_bytes()); // dbid = 0
-        let stg_name = b"StgWindsor\0";
-        stg_cmd.extend_from_slice(&(stg_name.len() as u16).to_le_bytes());
-        stg_cmd.extend_from_slice(stg_name);
-
-        let app_stg = tls.make_app_data(&stg_cmd).map_err(|e| e.to_string())?;
-        let rsp_stg = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_stg, Duration::from_secs(5)).await?;
-        let dec_stg = tls.parse_tls_response(&rsp_stg).map_err(|e| e.to_string())?;
-        let stg = parse_user_storage(&dec_stg)?
-            .ok_or_else(|| "StgWindsor storage not initialized on sensor".to_string())?;
-        let stg_id = stg.dbid;
-
-        // 5. Query Sensor Hardware Type (0x75)
-        let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &tls.make_app_data(&[0x75]).map_err(|e| e.to_string())?, Duration::from_secs(5)).await?;
-
-        // 6. Query Factory Bits (0x6f, tag 0x0e00)
-        let mut calib_data = Vec::new();
-        let mut calib_vals = Vec::new();
-        let mut fb_cmd = vec![0x6f];
-        fb_cmd.extend_from_slice(&0x0e00u16.to_le_bytes());
-        fb_cmd.extend_from_slice(&0u16.to_le_bytes());
-        fb_cmd.extend_from_slice(&0u32.to_le_bytes());
-        let app_fb = tls.make_app_data(&fb_cmd).map_err(|e| e.to_string())?;
-        let rsp_fb = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_fb, Duration::from_secs(5)).await?;
-        let dec_fb = tls.parse_tls_response(&rsp_fb).map_err(|e| e.to_string())?;
-
-        let entries = if dec_fb.len() >= 10 { LittleEndian::read_u32(&dec_fb[6..10]) as usize } else { 0 };
-        let mut fb_ptr = &dec_fb[10..];
-        for _ in 0..entries {
-            if fb_ptr.len() < 12 { break; }
-            let len = LittleEndian::read_u16(&fb_ptr[4..6]) as usize;
-            let subtag = LittleEndian::read_u16(&fb_ptr[8..10]);
-            fb_ptr = &fb_ptr[12..];
-            if len > fb_ptr.len() { break; }
-            let val = &fb_ptr[..len];
-            fb_ptr = &fb_ptr[len..];
-            if subtag == 3 && calib_vals.is_empty() && val.len() >= 4 {
-                calib_vals = val[4..].to_vec();
-            } else if subtag == 7 && calib_data.is_empty() && val.len() >= 4 {
-                calib_data = val[4..].to_vec();
-            }
-        }
-
-        if calib_data.is_empty() || calib_vals.is_empty() {
-            return Err("Failed to extract sensor calibration factory bits".into());
-        }
-
-        Ok(Self {
-            interface: iface,
-            out_ep,
-            in_ep,
-            int_ep,
-            tls,
-            calib_data,
-            calib_vals,
-            stg_id,
-        })
+        Err(format!("Sensor connection timed out: {}", last_err))
     }
 
     async fn raw_usb_cmd(
@@ -380,9 +460,30 @@ impl SensorDriver {
 
     pub async fn send_app_cmd(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
-        let rsp = Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await?;
-        let dec = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
-        Ok(dec)
+        match Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await {
+            Ok(rsp) => {
+                let parse_res = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string());
+                match parse_res {
+                    Ok(dec) => Ok(dec),
+                    Err(msg) => {
+                        eprintln!("TLS error ({}), attempting sensor reconnect...", msg);
+                        self.reconnect().await?;
+                        let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
+                        let rsp = Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await?;
+                        let dec = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
+                        Ok(dec)
+                    }
+                }
+            }
+            Err(msg) => {
+                eprintln!("USB I/O error ({}), attempting sensor reconnect...", msg);
+                self.reconnect().await?;
+                let app_req = self.tls.make_app_data(payload).map_err(|e| e.to_string())?;
+                let rsp = Self::raw_usb_cmd(&mut self.out_ep, &mut self.in_ep, &app_req, Duration::from_secs(5)).await?;
+                let dec = self.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())?;
+                Ok(dec)
+            }
+        }
     }
 
     pub async fn wait_int(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {

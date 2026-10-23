@@ -1,6 +1,6 @@
 [Unit]
 Description=Validity Fingerprint Authentication Daemon (Pure Rust)
-Documentation=https://github.com/cgalant/validity-rs
+Documentation=https://github.com/outlookhazy/validity-rs
 Conflicts=fprintd.service
 
 [Service]
