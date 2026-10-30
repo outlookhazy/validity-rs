@@ -13,6 +13,8 @@ A native Linux fingerprint daemon for Validity Sensors (`138a:0097`) commonly fo
   - Lock screen and user management support in KDE Plasma 6, SDDM, and GDM.
   - Compatible with standard CLI utilities (`fprintd-enroll`, `fprintd-verify`, `fprintd-delete`).
 - **Visual feedback:** Controls the sensor's LED ring during capture and enrollment.
+- **USB runtime power management:** Releases the USB interface when idle so the sensor and USB root hub enter kernel runtime suspend (`autosuspend`), waking on demand.
+- **Clamshell / docked lid awareness:** Skips fingerprint prompts via `systemd-logind` (`LidClosed`) when the laptop lid is closed so `sudo`, Polkit, and external-monitor lock screens fall back immediately to password.
 
 ## Hardware Support
 
@@ -25,7 +27,7 @@ A native Linux fingerprint daemon for Validity Sensors (`138a:0097`) commonly fo
 Install the latest package directly from GitHub Releases:
 
 ```bash
-sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.3/validity-rs-0.1.3-1.fc44.x86_64.rpm
+sudo dnf install -y https://github.com/outlookhazy/validity-rs/releases/download/v0.1.4/validity-rs-0.1.4-1.fc44.x86_64.rpm
 ```
 
 ### Building from Source

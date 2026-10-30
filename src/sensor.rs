@@ -1,5 +1,7 @@
 #![allow(dead_code)]
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use byteorder::{ByteOrder, LittleEndian};
 use nusb::transfer::{Buffer, Bulk, In, Interrupt, Out};
@@ -222,29 +224,35 @@ impl From<String> for CaptureError {
     }
 }
 
-struct DeviceConnection {
-    interface: nusb::Interface,
+struct UsbTransport {
+    _interface: nusb::Interface,
     out_ep: nusb::Endpoint<Bulk, Out>,
     in_ep: nusb::Endpoint<Bulk, In>,
     int_ep: nusb::Endpoint<Interrupt, In>,
-    tls: TlsSession,
 }
 
 pub struct SensorDriver {
-    conn: Option<DeviceConnection>,
+    transport: Option<UsbTransport>,
+    tls: Option<TlsSession>,
+    slept: Arc<AtomicBool>,
+    user_cache: HashMap<u32, Option<UserInfo>>,
     pub calib_data: Vec<u8>,
     pub calib_vals: Vec<u8>,
     pub stg_id: u16,
-    /// Incremented on every successful (re)connect. Sensor-side session state such as an
+    /// Incremented on every (re)connect. Sensor-side session state such as an
     /// in-progress enrollment does not survive a reconnect, so callers can detect that.
     pub generation: u64,
 }
 
 impl SensorDriver {
     pub async fn open() -> Result<Self, String> {
-        let (conn, calib_data, calib_vals, stg_id) = Self::connect(Some(Duration::from_secs(5))).await?;
+        let (transport, tls, calib_data, calib_vals, stg_id) =
+            Self::connect(Some(Duration::from_secs(5))).await?;
         Ok(Self {
-            conn: Some(conn),
+            transport: Some(transport),
+            tls: Some(tls),
+            slept: Arc::new(AtomicBool::new(false)),
+            user_cache: HashMap::new(),
             calib_data,
             calib_vals,
             stg_id,
@@ -252,13 +260,58 @@ impl SensorDriver {
         })
     }
 
+    /// Lock-free flag set by the PrepareForSleep(true) handler so the next `ensure_connected`
+    /// invalidates any pre-sleep TLS session even if the driver mutex was held entering sleep.
+    pub fn slept_flag(&self) -> Arc<AtomicBool> {
+        self.slept.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dummy_disconnected() -> Self {
+        Self {
+            transport: None,
+            tls: None,
+            slept: Arc::new(AtomicBool::new(false)),
+            user_cache: HashMap::new(),
+            calib_data: Vec::new(),
+            calib_vals: Vec::new(),
+            stg_id: 3,
+            generation: 1,
+        }
+    }
+
+    /// Release the open usbfs handle so the kernel can runtime-suspend the USB device and root
+    /// hub when idle. The 138a:0097 discards its TLS session while suspended (verified on
+    /// hardware: encrypted requests get raw non-TLS replies afterwards), so the session is
+    /// dropped too and the next use performs a full handshake. The user cache is kept.
+    pub fn suspend_usb(&mut self) {
+        self.tls = None;
+        if self.transport.take().is_some() {
+            eprintln!("Sensor idle; releasing USB interface for runtime suspend");
+        }
+    }
+
+    /// Drop both the USB handle and cached TLS session before S3 sleep (which cuts VBUS power
+    /// and resets sensor SRAM).
+    pub fn on_system_sleep(&mut self) {
+        self.transport = None;
+        self.tls = None;
+    }
+
     pub async fn reconnect(&mut self) -> Result<(), String> {
         eprintln!("Reconnecting sensor hardware...");
         // Explicitly drop old endpoints and interface so kernel frees interface 0 immediately
-        drop(self.conn.take());
+        drop(self.transport.take());
+        self.tls = None;
 
-        let (conn, calib_data, calib_vals, stg_id) = Self::connect(Some(Duration::from_secs(6))).await?;
-        self.conn = Some(conn);
+        let (transport, tls, calib_data, calib_vals, stg_id) =
+            Self::connect(Some(Duration::from_secs(6))).await?;
+        if stg_id != self.stg_id {
+            self.user_cache.clear();
+        }
+        self.slept.store(false, Ordering::SeqCst);
+        self.transport = Some(transport);
+        self.tls = Some(tls);
         self.calib_data = calib_data;
         self.calib_vals = calib_vals;
         self.stg_id = stg_id;
@@ -268,110 +321,96 @@ impl SensorDriver {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.conn.is_some()
+        self.transport.is_some()
     }
 
-    fn get_conn_mut(&mut self) -> Result<&mut DeviceConnection, String> {
-        self.conn.as_mut().ok_or_else(|| "Sensor device not connected".to_string())
+    pub fn peek_cached_user(&self, uid: u32) -> Option<&Option<UserInfo>> {
+        self.user_cache.get(&uid)
     }
 
     pub async fn ensure_connected(&mut self) -> Result<(), String> {
-        // Quick probe: query sensor hardware type (0x75)
-        let healthy = self.conn.is_some() && self.send_app_cmd_once(&[0x75]).await.is_ok();
-        if !healthy {
-            eprintln!("Sensor connection check failed, attempting reconnect...");
-            self.reconnect().await?;
+        if self.slept.swap(false, Ordering::SeqCst) {
+            self.transport = None;
+            self.tls = None;
         }
-        Ok(())
+
+        // Quick probe if USB is already open: query sensor hardware type (0x75)
+        if self.transport.is_some() {
+            if self.send_app_cmd_once(&[0x75]).await.is_ok() {
+                return Ok(());
+            }
+            eprintln!("Sensor connection check failed, attempting reconnect...");
+            return self.reconnect().await;
+        }
+
+        self.reconnect().await
     }
 
-    async fn connect(timeout: Option<Duration>) -> Result<(DeviceConnection, Vec<u8>, Vec<u8>, u16), String> {
+    async fn open_usb_transport_once(drain_timeout: Duration) -> Result<UsbTransport, String> {
+        let devices = nusb::list_devices().await
+            .map_err(|e| format!("USB list failed: {}", e))?;
+
+        let mut dev_info = None;
+        for d in devices {
+            if d.vendor_id() == 0x138a && d.product_id() == 0x0097 {
+                dev_info = Some(d);
+                break;
+            }
+        }
+
+        let di = dev_info
+            .ok_or_else(|| "Validity 138a:0097 sensor not found on USB bus".to_string())?;
+
+        let dev = di.open().await
+            .map_err(|e| format!("Failed to open USB device: {}", e))?;
+
+        let iface = dev.claim_interface(0).await
+            .map_err(|e| format!("Failed to claim interface 0: {}", e))?;
+
+        let out_ep = iface.endpoint::<Bulk, Out>(0x01)
+            .map_err(|e| format!("Failed to claim EP 0x01: {}", e))?;
+
+        let mut in_ep = iface.endpoint::<Bulk, In>(0x81)
+            .map_err(|e| format!("Failed to claim EP 0x81: {}", e))?;
+
+        let int_ep = iface.endpoint::<Interrupt, In>(0x83)
+            .map_err(|e| format!("Failed to claim EP 0x83: {}", e))?;
+
+        // Drain any leftover pending data
+        in_ep.submit(in_ep.allocate(64 * 1024));
+        let _ = tokio::time::timeout(drain_timeout, in_ep.next_complete()).await;
+
+        Ok(UsbTransport {
+            _interface: iface,
+            out_ep,
+            in_ep,
+            int_ep,
+        })
+    }
+
+    async fn connect(timeout: Option<Duration>) -> Result<(UsbTransport, TlsSession, Vec<u8>, Vec<u8>, u16), String> {
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
         let start = std::time::Instant::now();
         let mut last_err = "Validity 138a:0097 sensor not found on USB bus".to_string();
 
         while start.elapsed() < timeout {
-            let devices = match nusb::list_devices().await {
-                Ok(d) => d,
+            let mut transport = match Self::open_usb_transport_once(Duration::from_millis(50)).await {
+                Ok(t) => t,
                 Err(e) => {
-                    last_err = format!("USB list failed: {}", e);
+                    last_err = e;
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
             };
-
-            let mut dev_info = None;
-            for d in devices {
-                if d.vendor_id() == 0x138a && d.product_id() == 0x0097 {
-                    dev_info = Some(d);
-                    break;
-                }
-            }
-
-            let di = match dev_info {
-                Some(di) => di,
-                None => {
-                    last_err = "Validity 138a:0097 sensor not found on USB bus".to_string();
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let dev = match di.open().await {
-                Ok(dev) => dev,
-                Err(e) => {
-                    last_err = format!("Failed to open USB device: {}", e);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let iface = match dev.claim_interface(0).await {
-                Ok(iface) => iface,
-                Err(e) => {
-                    last_err = format!("Failed to claim interface 0: {}", e);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let mut out_ep = match iface.endpoint::<Bulk, Out>(0x01) {
-                Ok(ep) => ep,
-                Err(e) => {
-                    last_err = format!("Failed to claim EP 0x01: {}", e);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let mut in_ep = match iface.endpoint::<Bulk, In>(0x81) {
-                Ok(ep) => ep,
-                Err(e) => {
-                    last_err = format!("Failed to claim EP 0x81: {}", e);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            let int_ep = match iface.endpoint::<Interrupt, In>(0x83) {
-                Ok(ep) => ep,
-                Err(e) => {
-                    last_err = format!("Failed to claim EP 0x83: {}", e);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-            };
-
-            // Drain any leftover pending data
-            in_ep.submit(in_ep.allocate(64 * 1024));
-            let _ = tokio::time::timeout(Duration::from_millis(50), in_ep.next_complete()).await;
+            let out_ep = &mut transport.out_ep;
+            let in_ep = &mut transport.in_ep;
 
             let init_res: Result<(TlsSession, Vec<u8>, Vec<u8>, u16), String> = async {
                 // 1. Ping / initialization
-                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x01], Duration::from_secs(3)).await?;
-                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x19], Duration::from_secs(3)).await?;
-                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &[0x43, 0x02], Duration::from_secs(3)).await?;
-                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, INIT_HARDCODED, Duration::from_secs(5)).await?;
+                let _ = Self::raw_usb_cmd(out_ep, in_ep, &[0x01], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(out_ep, in_ep, &[0x19], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(out_ep, in_ep, &[0x43, 0x02], Duration::from_secs(3)).await?;
+                let _ = Self::raw_usb_cmd(out_ep, in_ep, INIT_HARDCODED, Duration::from_secs(5)).await?;
 
                 // 2. Read Partition 1
                 let mut read_p1_cmd = Vec::new();
@@ -382,7 +421,7 @@ impl SensorDriver {
                 read_p1_cmd.extend_from_slice(&0u32.to_le_bytes()); // addr = 0
                 read_p1_cmd.extend_from_slice(&0x1000u32.to_le_bytes()); // size = 4096
 
-                let p1_rsp = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &read_p1_cmd, Duration::from_secs(5)).await?;
+                let p1_rsp = Self::raw_usb_cmd(out_ep, in_ep, &read_p1_cmd, Duration::from_secs(5)).await?;
                 if p1_rsp.len() < 10 {
                     return Err("Partition 1 read truncated".into());
                 }
@@ -417,12 +456,12 @@ impl SensorDriver {
                 // 3. TLS 1.2 Handshake
                 let mut tls = TlsSession::new();
                 let client_hello = tls.make_client_hello();
-                let rsp_sh = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &client_hello, Duration::from_secs(10)).await?;
+                let rsp_sh = Self::raw_usb_cmd(out_ep, in_ep, &client_hello, Duration::from_secs(10)).await?;
                 tls.parse_tls_response(&rsp_sh).map_err(|e| e.to_string())?;
 
                 let finish_pkt = tls.make_keys_and_finish(&dev_key, &host_key, &tls_cert)
                     .map_err(|e| e.to_string())?;
-                let rsp_fin = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &finish_pkt, Duration::from_secs(10)).await?;
+                let rsp_fin = Self::raw_usb_cmd(out_ep, in_ep, &finish_pkt, Duration::from_secs(10)).await?;
                 tls.parse_tls_response(&rsp_fin).map_err(|e| e.to_string())?;
 
                 // 4. Query Windsor Storage record ID
@@ -433,14 +472,14 @@ impl SensorDriver {
                 stg_cmd.extend_from_slice(stg_name);
 
                 let app_stg = tls.make_app_data(&stg_cmd).map_err(|e| e.to_string())?;
-                let rsp_stg = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_stg, Duration::from_secs(5)).await?;
+                let rsp_stg = Self::raw_usb_cmd(out_ep, in_ep, &app_stg, Duration::from_secs(5)).await?;
                 let dec_stg = tls.parse_tls_response(&rsp_stg).map_err(|e| e.to_string())?;
                 let stg = parse_user_storage(&dec_stg)?
                     .ok_or_else(|| "StgWindsor storage not initialized on sensor".to_string())?;
                 let stg_id = stg.dbid;
 
                 // 5. Query Sensor Hardware Type (0x75)
-                let _ = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &tls.make_app_data(&[0x75]).map_err(|e| e.to_string())?, Duration::from_secs(5)).await?;
+                let _ = Self::raw_usb_cmd(out_ep, in_ep, &tls.make_app_data(&[0x75]).map_err(|e| e.to_string())?, Duration::from_secs(5)).await?;
 
                 // 6. Query Factory Bits (0x6f, tag 0x0e00)
                 let mut calib_data = Vec::new();
@@ -450,7 +489,7 @@ impl SensorDriver {
                 fb_cmd.extend_from_slice(&0u16.to_le_bytes());
                 fb_cmd.extend_from_slice(&0u32.to_le_bytes());
                 let app_fb = tls.make_app_data(&fb_cmd).map_err(|e| e.to_string())?;
-                let rsp_fb = Self::raw_usb_cmd(&mut out_ep, &mut in_ep, &app_fb, Duration::from_secs(5)).await?;
+                let rsp_fb = Self::raw_usb_cmd(out_ep, in_ep, &app_fb, Duration::from_secs(5)).await?;
                 let dec_fb = tls.parse_tls_response(&rsp_fb).map_err(|e| e.to_string())?;
 
                 let entries = if dec_fb.len() >= 10 { LittleEndian::read_u32(&dec_fb[6..10]) as usize } else { 0 };
@@ -479,14 +518,7 @@ impl SensorDriver {
 
             match init_res {
                 Ok((tls, calib_data, calib_vals, stg_id)) => {
-                    let conn = DeviceConnection {
-                        interface: iface,
-                        out_ep,
-                        in_ep,
-                        int_ep,
-                        tls,
-                    };
-                    return Ok((conn, calib_data, calib_vals, stg_id));
+                    return Ok((transport, tls, calib_data, calib_vals, stg_id));
                 }
                 Err(e) => {
                     last_err = e;
@@ -521,10 +553,15 @@ impl SensorDriver {
     }
 
     /// One encrypted request/response round trip on an established connection.
-    async fn exchange(conn: &mut DeviceConnection, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
-        let app_req = conn.tls.make_app_data(payload).map_err(|e| e.to_string())?;
-        let rsp = Self::raw_usb_cmd(&mut conn.out_ep, &mut conn.in_ep, &app_req, timeout).await?;
-        conn.tls.parse_tls_response(&rsp).map_err(|e| e.to_string())
+    async fn exchange(
+        transport: &mut UsbTransport,
+        tls: &mut TlsSession,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let app_req = tls.make_app_data(payload).map_err(|e| e.to_string())?;
+        let rsp = Self::raw_usb_cmd(&mut transport.out_ep, &mut transport.in_ep, &app_req, timeout).await?;
+        tls.parse_tls_response(&rsp).map_err(|e| e.to_string())
     }
 
     /// Send a command exactly once. Use this for anything that mutates sensor state.
@@ -533,18 +570,21 @@ impl SensorDriver {
     /// or the sensor may deliver the late reply to the *next* request. Reconnecting is the
     /// only way to guarantee requests and responses stay paired.
     pub async fn send_app_cmd_once(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let conn = self.get_conn_mut()?;
-        let res = Self::exchange(conn, payload, Duration::from_secs(5)).await;
+        let (Some(transport), Some(tls)) = (self.transport.as_mut(), self.tls.as_mut()) else {
+            return Err("Sensor device not connected".to_string());
+        };
+        let res = Self::exchange(transport, tls, payload, Duration::from_secs(5)).await;
         if res.is_err() {
-            self.conn = None;
+            self.transport = None;
+            self.tls = None;
         }
         res
     }
 
     /// Send an idempotent command, reconnecting and retrying once on failure.
     pub async fn send_app_cmd(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        if self.conn.is_none() {
-            self.reconnect().await?;
+        if self.transport.is_none() {
+            self.ensure_connected().await?;
         }
         match self.send_app_cmd_once(payload).await {
             Ok(dec) => Ok(dec),
@@ -561,11 +601,12 @@ impl SensorDriver {
     /// Exactly one interrupt transfer is kept outstanding; on timeout it stays queued and is
     /// picked up by the next call, so transfers never pile up and no interrupt is lost.
     pub async fn poll_int(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
-        let conn = self.get_conn_mut()?;
-        if conn.int_ep.pending() == 0 {
-            conn.int_ep.submit(conn.int_ep.allocate(1024));
+        let transport = self.transport.as_mut()
+            .ok_or_else(|| "Sensor device not connected".to_string())?;
+        if transport.int_ep.pending() == 0 {
+            transport.int_ep.submit(transport.int_ep.allocate(1024));
         }
-        let res = match tokio::time::timeout(timeout, conn.int_ep.next_complete()).await {
+        let res = match tokio::time::timeout(timeout, transport.int_ep.next_complete()).await {
             Err(_) => return Ok(None),
             Ok(comp) => comp.into_result()
                 .map(|buf| buf.to_vec())
@@ -574,7 +615,8 @@ impl SensorDriver {
         match res {
             Ok(buf) => Ok(Some(buf)),
             Err(e) => {
-                self.conn = None;
+                self.transport = None;
+                self.tls = None;
                 Err(e)
             }
         }
@@ -621,12 +663,13 @@ impl SensorDriver {
 
     /// Abort whatever the sensor is doing and turn the LED off. Never reconnects.
     pub async fn cancel_current(&mut self) -> Result<(), String> {
-        if let Some(conn) = self.conn.as_mut() {
-            if Self::exchange(conn, &[0x04], Duration::from_secs(1)).await.is_err() {
-                self.conn = None;
+        if let (Some(transport), Some(tls)) = (self.transport.as_mut(), self.tls.as_mut()) {
+            if Self::exchange(transport, tls, &[0x04], Duration::from_secs(1)).await.is_err() {
+                self.transport = None;
+                self.tls = None;
             }
         }
-        if self.conn.is_some() {
+        if self.transport.is_some() {
             let _ = self.led_glow(false).await;
         }
         Ok(())
@@ -835,6 +878,7 @@ impl SensorDriver {
         storage: u16,
         data: &[u8],
     ) -> Result<u16, String> {
+        self.user_cache.clear();
         self.write_enable().await?;
         let mut req = vec![0x47];
         req.extend_from_slice(&parent.to_le_bytes());
@@ -854,7 +898,7 @@ impl SensorDriver {
         Ok(LittleEndian::read_u16(&rsp[2..4]))
     }
 
-    pub async fn lookup_user(&mut self, uid: u32) -> Result<Option<UserInfo>, String> {
+    pub async fn lookup_user_uncached(&mut self, uid: u32) -> Result<Option<UserInfo>, String> {
         let identity = uid_to_identity_bytes(uid);
         let mut req = vec![0x4a, 0x00, 0x00];
         req.extend_from_slice(&self.stg_id.to_le_bytes());
@@ -862,11 +906,20 @@ impl SensorDriver {
         req.extend_from_slice(&identity);
 
         let rsp = self.send_app_cmd(&req).await?;
-        if rsp.len() >= 2 && LittleEndian::read_u16(&rsp[0..2]) == 0x04b3 {
-            return Ok(None);
-        }
+        let parsed = if rsp.len() >= 2 && LittleEndian::read_u16(&rsp[0..2]) == 0x04b3 {
+            None
+        } else {
+            Some(parse_user(&rsp)?)
+        };
+        self.user_cache.insert(uid, parsed.clone());
+        Ok(parsed)
+    }
 
-        parse_user(&rsp).map(Some)
+    pub async fn lookup_user(&mut self, uid: u32) -> Result<Option<UserInfo>, String> {
+        if let Some(cached) = self.user_cache.get(&uid) {
+            return Ok(cached.clone());
+        }
+        self.lookup_user_uncached(uid).await
     }
 
     pub async fn new_user(&mut self, uid: u32) -> Result<u16, String> {
@@ -884,10 +937,12 @@ impl SensorDriver {
         let tinfo = make_finger_data(subtype, template, tid);
         let recid = self.new_record(user_dbid, 0x000b, self.stg_id, &tinfo).await?;
         let _ = self.wait_int(Duration::from_secs(3)).await?;
+        self.user_cache.clear();
         Ok(recid)
     }
 
     pub async fn del_record(&mut self, recid: u16) -> Result<(), String> {
+        self.user_cache.clear();
         self.write_enable().await?;
         let mut req = vec![0x48];
         req.extend_from_slice(&recid.to_le_bytes());
@@ -901,7 +956,7 @@ impl SensorDriver {
     }
 
     pub async fn del_finger(&mut self, uid: u32, subtype: u16) -> Result<bool, String> {
-        let user_info = match self.lookup_user(uid).await? {
+        let user_info = match self.lookup_user_uncached(uid).await? {
             Some(u) => u,
             None => return Ok(false),
         };

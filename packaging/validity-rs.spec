@@ -1,5 +1,5 @@
 Name:           validity-rs
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Native fingerprint authentication daemon for Validity sensors (138a:0097)
 
@@ -24,7 +24,7 @@ rm -rf $RPM_BUILD_ROOT
 cp %{_sourcedir}/LICENSE .
 install -D -p -m 0755 %{_sourcedir}/target/release/validity-rs $RPM_BUILD_ROOT%{_libexecdir}/validity-rs
 install -D -p -m 0644 %{_sourcedir}/packaging/validity-rs.service $RPM_BUILD_ROOT%{_unitdir}/validity-rs.service
-install -D -p -m 0644 %{_sourcedir}/packaging/70-validity.rules $RPM_BUILD_ROOT%{_udevrulesdir}/70-validity.rules
+install -D -p -m 0644 %{_sourcedir}/packaging/65-validity.rules $RPM_BUILD_ROOT%{_udevrulesdir}/65-validity.rules
 
 %post
 /usr/bin/systemctl mask fprintd.service 2>/dev/null || :
@@ -44,15 +44,24 @@ if [ $1 -eq 0 ]; then
 fi
 
 %postun
+/usr/bin/udevadm control --reload-rules 2>/dev/null || :
 %systemd_postun_with_restart validity-rs.service
 
 %files
 %license LICENSE
 %{_libexecdir}/validity-rs
 %{_unitdir}/validity-rs.service
-%{_udevrulesdir}/70-validity.rules
+%{_udevrulesdir}/65-validity.rules
 
 %changelog
+* Thu Oct 29 2026 cgalant - 0.1.4-1
+- Release open USB handle after 5s of idle time so 138a:0097 and usb1 enter kernel USB runtime suspend
+- Cache enrolled user metadata in memory so ListEnrolledFingers and non-enrolled checks avoid USB wakeups
+- Skip fingerprint verification/enrollment when laptop lid is closed (clamshell/docked mode) so PAM falls back immediately to password without waking USB
+- Cancel unreachable active prompts if lid closes while staying awake, while preserving S3 sleep/resume lockscreen unlock
+- Avoid redundant post-sleep reconnects and skip reconnecting on lid-closed wake
+- Move udev rule to 65-validity.rules with MTP_NO_PROBE=1 and power/control=auto
+
 * Fri Oct 23 2026 cgalant - 0.1.3-1
 - Security: claim-scoped D-Bus methods (Enroll/Verify/Delete/Stop/Release) now require
   the caller to be the client that claimed the device

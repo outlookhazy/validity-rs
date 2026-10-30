@@ -1,0 +1,4 @@
+# Validity Fingerprint Sensor (138a:0097)
+# Numbered 65 so ENV{MTP_NO_PROBE}="1" takes effect before 69-libmtp.rules probes interface claims.
+SUBSYSTEM=="usb", ATTR{idVendor}=="138a", ATTR{idProduct}=="0097", MODE="0660", ENV{MTP_NO_PROBE}="1"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="138a", ATTR{idProduct}=="0097", TEST=="power/control", ATTR{power/control}="auto"

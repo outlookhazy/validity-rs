@@ -1,4 +1,4 @@
 /target
 upstream-open-fprintd/
 upstream-python-validity/
-70-validity.rules
+/70-validity.rules
